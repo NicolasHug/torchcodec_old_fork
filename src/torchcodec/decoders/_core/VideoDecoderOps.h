@@ -73,6 +73,8 @@ at::Tensor get_frames_in_range(
 // Get the next frame from the video as a tensor.
 at::Tensor get_next_frame(at::Tensor& decoder);
 
+std::tuple<at::Tensor, double, double> get_next_frame_with_info(at::Tensor& decoder);
+
 // Get the metadata from the video as a string.
 std::string get_json_metadata(at::Tensor& decoder);
 

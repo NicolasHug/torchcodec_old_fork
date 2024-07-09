@@ -26,6 +26,7 @@ TORCH_LIBRARY(torchcodec_ns, m) {
       "add_video_stream(Tensor(a!) decoder, *, int? width=None, int? height=None, int? num_threads=None, str? shape=None, int? stream_index=None) -> ()");
   m.def("seek_to_pts(Tensor(a!) decoder, float seconds) -> ()");
   m.def("get_next_frame(Tensor(a!) decoder) -> Tensor");
+  m.def("get_next_frame_with_info(Tensor(a!) decoder) -> (Tensor, float, float)");
   m.def("get_frame_at_pts(Tensor(a!) decoder, float seconds) -> Tensor");
   m.def(
       "get_frame_at_index(Tensor(a!) decoder, *, int stream_index, int frame_index) -> Tensor");
@@ -126,6 +127,13 @@ at::Tensor get_next_frame(at::Tensor& decoder) {
         std::to_string(result.sizes().size()));
   }
   return result;
+}
+
+std::tuple<at::Tensor, double, double> get_next_frame_with_info(at::Tensor& decoder) {
+  auto videoDecoder = unwrapTensorToGetDecoder(decoder);
+  auto result = videoDecoder->getNextDecodedOutput();
+  return std::make_tuple(
+      result.frame, result.ptsSeconds, result.durationSeconds);
 }
 
 at::Tensor get_frame_at_pts(at::Tensor& decoder, double seconds) {
@@ -389,6 +397,7 @@ TORCH_LIBRARY_IMPL(torchcodec_ns, CPU, m) {
   m.impl("seek_to_pts", &seek_to_pts);
   m.impl("add_video_stream", &add_video_stream);
   m.impl("get_next_frame", &get_next_frame);
+  m.impl("get_next_frame_with_info", &get_next_frame_with_info);
   m.impl("get_json_metadata", &get_json_metadata);
   m.impl("get_container_json_metadata", &get_container_json_metadata);
   m.impl("get_stream_json_metadata", &get_stream_json_metadata);

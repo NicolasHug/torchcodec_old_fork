@@ -55,6 +55,7 @@ create_from_tensor = torch._dynamo.disallow_in_graph(
 add_video_stream = torch.ops.torchcodec_ns.add_video_stream.default
 seek_to_pts = torch.ops.torchcodec_ns.seek_to_pts.default
 get_next_frame = torch.ops.torchcodec_ns.get_next_frame.default
+# get_next_frame_with_info = torch.ops.torchcodec_ns.get_next_frame_with_info.default
 get_frame_at_pts = torch.ops.torchcodec_ns.get_frame_at_pts.default
 get_frame_at_index = torch.ops.torchcodec_ns.get_frame_at_index.default
 get_frame_with_info_at_index = (
@@ -119,6 +120,11 @@ def get_next_frame_abstract(decoder: torch.Tensor) -> torch.Tensor:
     # The exact permutation depends on the constructor options passed in.
     image_size = [get_ctx().new_dynamic_size() for _ in range(3)]
     return torch.empty(image_size)
+
+@register_fake("torchcodec_ns::get_next_frame_with_info")
+def get_next_frame_with_info_abstract(decoder: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
+    image_size = [get_ctx().new_dynamic_size() for _ in range(3)]
+    return (torch.empty(image_size), 0, 0)
 
 
 @register_fake("torchcodec_ns::get_frame_at_pts")
