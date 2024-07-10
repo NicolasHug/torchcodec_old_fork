@@ -129,7 +129,7 @@ def get_next_frame_abstract(decoder: torch.Tensor) -> torch.Tensor:
     image_size = [get_ctx().new_dynamic_size() for _ in range(3)]
     return torch.empty(image_size)
 
-@register_fake("torchcodec_ns::get_next_frame_with_info")
+@impl_abstract("torchcodec_ns::get_next_frame_with_info")
 def get_next_frame_with_info_abstract(decoder: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
     image_size = [get_ctx().new_dynamic_size() for _ in range(3)]
     return (torch.empty(image_size), 0, 0)
