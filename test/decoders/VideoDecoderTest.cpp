@@ -1,16 +1,25 @@
-// (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
 
-#include "src/torchcodec/decoders/core/VideoDecoder.h"
+#include "src/torchcodec/decoders/_core/VideoDecoder.h"
 
+#include <c10/util/Flags.h>
 #include <gtest/gtest.h>
-#include <opencv2/opencv.hpp>
+#include <torch/torch.h>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 
+#ifdef FBCODE_BUILD
 #include "tools/cxx/Resources.h"
+#endif
 
 using namespace ::testing;
 
-DEFINE_bool(
+C10_DEFINE_bool(
     dump_frames_for_debugging,
     false,
     "If true, we dump frames as bmp files for debugging.");
@@ -18,7 +27,15 @@ DEFINE_bool(
 namespace facebook::torchcodec {
 
 std::string getResourcePath(const std::string& filename) {
-  return build::getResourcePath(filename).string();
+#ifdef FBCODE_BUILD
+  std::string filepath = "pytorch/torchcodec/test/resources/" + filename;
+  filepath = build::getResourcePath(filepath).string();
+#else
+  std::filesystem::path dirPath = std::filesystem::path(__FILE__);
+  std::string filepath =
+      dirPath.parent_path().string() + "/../resources/" + filename;
+#endif
+  return filepath;
 }
 
 class VideoDecoderTest : public testing::TestWithParam<bool> {
@@ -42,14 +59,17 @@ class VideoDecoderTest : public testing::TestWithParam<bool> {
 };
 
 TEST_P(VideoDecoderTest, ReturnsFpsAndDurationForVideoInMetadata) {
-  std::string path = getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4");
+  std::string path = getResourcePath("nasa_13013.mp4");
   std::unique_ptr<VideoDecoder> decoder =
       createDecoderFromPath(path, GetParam());
   VideoDecoder::ContainerMetadata metadata = decoder->getContainerMetadata();
   EXPECT_EQ(metadata.numAudioStreams, 2);
   EXPECT_EQ(metadata.numVideoStreams, 2);
+#if LIBAVFORMAT_VERSION_MAJOR >= 60
+  EXPECT_NEAR(metadata.bitRate.value(), 412365, 1e-1);
+#else
   EXPECT_NEAR(metadata.bitRate.value(), 324915, 1e-1);
+#endif
   EXPECT_EQ(metadata.streams.size(), 6);
   const auto& videoStream = metadata.streams[3];
   EXPECT_EQ(videoStream.mediaType, AVMEDIA_TYPE_VIDEO);
@@ -75,38 +95,24 @@ TEST(VideoDecoderTest, MissingVideoFileThrowsException) {
       std::invalid_argument);
 }
 
-void dumpTensorToBMP(const torch::Tensor& tensor, const std::string& filename) {
-  if (tensor.dim() != 3 || tensor.scalar_type() != torch::kUInt8) {
-    std::cerr
-        << "Error: Input tensor must be 3-dimensional and of type uint8_t."
-        << std::endl;
-    return;
-  }
-  cv::Mat image(tensor.size(0), tensor.size(1), CV_8UC3, tensor.data_ptr());
-  image = image.clone();
-  // OpenCV saves images in BGR format, so convert from RGB to BGR
-  cv::cvtColor(image, image, cv::COLOR_RGB2BGR);
-  cv::imwrite(filename, image);
+void dumpTensorToDisk(
+    const torch::Tensor& tensor,
+    const std::string& filename) {
+  std::vector<char> bytes = torch::pickle_save(tensor);
+  std::ofstream fout(filename, std::ios::out | std::ios::binary);
+  fout.write(bytes.data(), bytes.size());
+  fout.close();
 }
 
-torch::Tensor readTensorFromBMP(const std::string& filename) {
-  cv::Mat image = cv::imread(filename);
-
-  CHECK_NE(image.data, nullptr) << "could not open file: " << filename;
-  // OpenCV reads images in BGR format, so convert from BGR to RGB
-  cv::cvtColor(image, image, cv::COLOR_BGR2RGB);
-  int height = image.rows;
-  int width = image.cols;
-  int channels = image.channels();
-  auto options = torch::TensorOptions()
-                     .dtype(torch::kUInt8)
-                     .layout(torch::kStrided)
-                     .device(torch::kCPU);
-  torch::Tensor tensor = torch::empty({height, width, channels}, options);
-  memcpy(tensor.data_ptr(), image.data, height * width * channels);
-  std::cout << "Read tensor from " << filename << ": " << tensor.sizes()
-            << std::endl;
-  return tensor;
+torch::Tensor readTensorFromDisk(const std::string& filename) {
+  std::string filepath = getResourcePath(filename);
+  std::ifstream file(filepath, std::ios::binary);
+  std::vector<char> data(
+      (std::istreambuf_iterator<char>(file)),
+      (std::istreambuf_iterator<char>()));
+  VLOG(3) << "Read tensor from disk: " << filepath << ": " << data.size()
+          << std::endl;
+  return torch::pickle_load(data).toTensor().permute({2, 0, 1});
 }
 
 torch::Tensor floatAndNormalizeFrame(const torch::Tensor& frame) {
@@ -128,15 +134,14 @@ double computeAverageCosineSimilarity(
 
 // TEST(DecoderOptionsTest, ConvertsFromStringToOptions) {
 //   std::string optionsString =
-//       "ffmpeg_thread_count=3,shape=NCHW,width=100,height=120";
+//       "ffmpeg_thread_count=3,dimension_order=NCHW,width=100,height=120";
 //   VideoDecoder::DecoderOptions options =
 //       VideoDecoder::DecoderOptions(optionsString);
 //   EXPECT_EQ(options.ffmpegThreadCount, 3);
 // }
 
 TEST(VideoDecoderTest, RespectsWidthAndHeightFromOptions) {
-  std::string path = getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4");
+  std::string path = getResourcePath("nasa_13013.mp4");
   std::unique_ptr<VideoDecoder> decoder =
       VideoDecoder::createFromFilePath(path);
   VideoDecoder::VideoStreamDecoderOptions streamOptions;
@@ -144,71 +149,60 @@ TEST(VideoDecoderTest, RespectsWidthAndHeightFromOptions) {
   streamOptions.height = 120;
   decoder->addVideoStreamDecoder(-1, streamOptions);
   torch::Tensor tensor = decoder->getNextDecodedOutput().frame;
-  EXPECT_EQ(tensor.sizes(), std::vector<long>({120, 100, 3}));
+  EXPECT_EQ(tensor.sizes(), std::vector<long>({3, 120, 100}));
 }
 
-TEST(VideoDecoderTest, RespectsOutputTensorShapeFromOptions) {
-  std::string path = getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4");
+TEST(VideoDecoderTest, RespectsOutputTensorDimensionOrderFromOptions) {
+  std::string path = getResourcePath("nasa_13013.mp4");
   std::unique_ptr<VideoDecoder> decoder =
       VideoDecoder::createFromFilePath(path);
   VideoDecoder::VideoStreamDecoderOptions streamOptions;
-  streamOptions.shape = "NCHW";
+  streamOptions.dimensionOrder = "NHWC";
   decoder->addVideoStreamDecoder(-1, streamOptions);
   torch::Tensor tensor = decoder->getNextDecodedOutput().frame;
-  EXPECT_EQ(tensor.sizes(), std::vector<long>({3, 270, 480}));
+  EXPECT_EQ(tensor.sizes(), std::vector<long>({270, 480, 3}));
 }
 
 TEST_P(VideoDecoderTest, ReturnsFirstTwoFramesOfVideo) {
-  std::string path = getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4");
+  std::string path = getResourcePath("nasa_13013.mp4");
   std::unique_ptr<VideoDecoder> ourDecoder =
       createDecoderFromPath(path, GetParam());
   ourDecoder->addVideoStreamDecoder(-1);
   auto output = ourDecoder->getNextDecodedOutput();
-  torch::Tensor tensor1FromOurDecoder = output.frame;
-  EXPECT_EQ(tensor1FromOurDecoder.sizes(), std::vector<long>({270, 480, 3}));
+  torch::Tensor tensor0FromOurDecoder = output.frame;
+  EXPECT_EQ(tensor0FromOurDecoder.sizes(), std::vector<long>({3, 270, 480}));
   EXPECT_EQ(output.ptsSeconds, 0.0);
   EXPECT_EQ(output.pts, 0);
   output = ourDecoder->getNextDecodedOutput();
-  torch::Tensor tensor2FromOurDecoder = output.frame;
-  EXPECT_EQ(tensor2FromOurDecoder.sizes(), std::vector<long>({270, 480, 3}));
+  torch::Tensor tensor1FromOurDecoder = output.frame;
+  EXPECT_EQ(tensor1FromOurDecoder.sizes(), std::vector<long>({3, 270, 480}));
   EXPECT_EQ(output.ptsSeconds, 1'001. / 30'000);
   EXPECT_EQ(output.pts, 1001);
 
-  torch::Tensor tensor1FromFFMPEG = readTensorFromBMP(getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.frame000001.bmp"));
-  torch::Tensor tensor2FromFFMPEG = readTensorFromBMP(getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.frame000002.bmp"));
+  torch::Tensor tensor0FromFFMPEG =
+      readTensorFromDisk("nasa_13013.mp4.frame000000.pt");
+  torch::Tensor tensor1FromFFMPEG =
+      readTensorFromDisk("nasa_13013.mp4.frame000001.pt");
 
-  EXPECT_EQ(tensor1FromFFMPEG.sizes(), std::vector<long>({270, 480, 3}));
+  EXPECT_EQ(tensor1FromFFMPEG.sizes(), std::vector<long>({3, 270, 480}));
+  EXPECT_TRUE(torch::equal(tensor0FromOurDecoder, tensor0FromFFMPEG));
   EXPECT_TRUE(torch::equal(tensor1FromOurDecoder, tensor1FromFFMPEG));
-  EXPECT_TRUE(torch::equal(tensor2FromOurDecoder, tensor2FromFFMPEG));
+  EXPECT_TRUE(
+      torch::allclose(tensor0FromOurDecoder, tensor0FromFFMPEG, 0.1, 20));
+  EXPECT_EQ(tensor1FromFFMPEG.sizes(), std::vector<long>({3, 270, 480}));
   EXPECT_TRUE(
       torch::allclose(tensor1FromOurDecoder, tensor1FromFFMPEG, 0.1, 20));
-  EXPECT_EQ(tensor2FromFFMPEG.sizes(), std::vector<long>({270, 480, 3}));
-  EXPECT_TRUE(
-      torch::allclose(tensor2FromOurDecoder, tensor2FromFFMPEG, 0.1, 20));
 
   if (FLAGS_dump_frames_for_debugging) {
-    dumpTensorToBMP(
-        tensor1FromFFMPEG,
-        "pytorch/torchcodec/test/decoders/tensor1FromFFMPEG.bmp");
-    dumpTensorToBMP(
-        tensor2FromFFMPEG,
-        "pytorch/torchcodec/test/decoders/tensor2FromFFMPEG.bmp");
-    dumpTensorToBMP(
-        tensor1FromOurDecoder,
-        "pytorch/torchcodec/test/decoders/tensor1FromOurDecoder.bmp");
-    dumpTensorToBMP(
-        tensor2FromOurDecoder,
-        "pytorch/torchcodec/test/decoders/tensor2FromOurDecoder.bmp");
+    dumpTensorToDisk(tensor0FromFFMPEG, "tensor0FromFFMPEG.pt");
+    dumpTensorToDisk(tensor1FromFFMPEG, "tensor1FromFFMPEG.pt");
+    dumpTensorToDisk(tensor0FromOurDecoder, "tensor0FromOurDecoder.pt");
+    dumpTensorToDisk(tensor1FromOurDecoder, "tensor1FromOurDecoder.pt");
   }
 }
 
-TEST_P(VideoDecoderTest, DecodesFramesInABatchInNHWC) {
-  std::string path = getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4");
+TEST_P(VideoDecoderTest, DecodesFramesInABatchInNCHW) {
+  std::string path = getResourcePath("nasa_13013.mp4");
   std::unique_ptr<VideoDecoder> ourDecoder =
       createDecoderFromPath(path, GetParam());
   ourDecoder->scanFileAndUpdateMetadataAndIndex();
@@ -218,20 +212,19 @@ TEST_P(VideoDecoderTest, DecodesFramesInABatchInNHWC) {
   // Frame with index 180 corresponds to timestamp 6.006.
   auto output = ourDecoder->getFramesAtIndexes(bestVideoStreamIndex, {0, 180});
   auto tensor = output.frames;
-  EXPECT_EQ(tensor.sizes(), std::vector<long>({2, 270, 480, 3}));
+  EXPECT_EQ(tensor.sizes(), std::vector<long>({2, 3, 270, 480}));
 
-  torch::Tensor tensor1FromFFMPEG = readTensorFromBMP(getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.frame000001.bmp"));
-  torch::Tensor tensor2FromFFMPEG = readTensorFromBMP(getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.time6.000000.bmp"));
+  torch::Tensor tensor0FromFFMPEG =
+      readTensorFromDisk("nasa_13013.mp4.frame000000.pt");
+  torch::Tensor tensorTime6FromFFMPEG =
+      readTensorFromDisk("nasa_13013.mp4.time6.000000.pt");
 
-  EXPECT_TRUE(torch::equal(tensor[0], tensor1FromFFMPEG));
-  EXPECT_TRUE(torch::equal(tensor[1], tensor2FromFFMPEG));
+  EXPECT_TRUE(torch::equal(tensor[0], tensor0FromFFMPEG));
+  EXPECT_TRUE(torch::equal(tensor[1], tensorTime6FromFFMPEG));
 }
 
-TEST_P(VideoDecoderTest, DecodesFramesInABatchInNCHW) {
-  std::string path = getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4");
+TEST_P(VideoDecoderTest, DecodesFramesInABatchInNHWC) {
+  std::string path = getResourcePath("nasa_13013.mp4");
   std::unique_ptr<VideoDecoder> ourDecoder =
       createDecoderFromPath(path, GetParam());
   ourDecoder->scanFileAndUpdateMetadataAndIndex();
@@ -239,25 +232,24 @@ TEST_P(VideoDecoderTest, DecodesFramesInABatchInNCHW) {
       *ourDecoder->getContainerMetadata().bestVideoStreamIndex;
   ourDecoder->addVideoStreamDecoder(
       bestVideoStreamIndex,
-      VideoDecoder::VideoStreamDecoderOptions("shape=NCHW"));
+      VideoDecoder::VideoStreamDecoderOptions("dimension_order=NHWC"));
   // Frame with index 180 corresponds to timestamp 6.006.
   auto output = ourDecoder->getFramesAtIndexes(bestVideoStreamIndex, {0, 180});
   auto tensor = output.frames;
-  EXPECT_EQ(tensor.sizes(), std::vector<long>({2, 3, 270, 480}));
+  EXPECT_EQ(tensor.sizes(), std::vector<long>({2, 270, 480, 3}));
 
-  torch::Tensor tensor1FromFFMPEG = readTensorFromBMP(getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.frame000001.bmp"));
-  torch::Tensor tensor2FromFFMPEG = readTensorFromBMP(getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.time6.000000.bmp"));
+  torch::Tensor tensor0FromFFMPEG =
+      readTensorFromDisk("nasa_13013.mp4.frame000000.pt");
+  torch::Tensor tensorTime6FromFFMPEG =
+      readTensorFromDisk("nasa_13013.mp4.time6.000000.pt");
 
-  tensor = tensor.permute({0, 2, 3, 1});
-  EXPECT_TRUE(torch::equal(tensor[0], tensor1FromFFMPEG));
-  EXPECT_TRUE(torch::equal(tensor[1], tensor2FromFFMPEG));
+  tensor = tensor.permute({0, 3, 1, 2});
+  EXPECT_TRUE(torch::equal(tensor[0], tensor0FromFFMPEG));
+  EXPECT_TRUE(torch::equal(tensor[1], tensorTime6FromFFMPEG));
 }
 
 TEST_P(VideoDecoderTest, SeeksCloseToEof) {
-  std::string path = getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4");
+  std::string path = getResourcePath("nasa_13013.mp4");
   std::unique_ptr<VideoDecoder> ourDecoder =
       createDecoderFromPath(path, GetParam());
   ourDecoder->addVideoStreamDecoder(-1);
@@ -270,8 +262,7 @@ TEST_P(VideoDecoderTest, SeeksCloseToEof) {
 }
 
 TEST_P(VideoDecoderTest, GetsFrameDisplayedAtTimestamp) {
-  std::string path = getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4");
+  std::string path = getResourcePath("nasa_13013.mp4");
   std::unique_ptr<VideoDecoder> ourDecoder =
       createDecoderFromPath(path, GetParam());
   ourDecoder->addVideoStreamDecoder(-1);
@@ -302,8 +293,7 @@ TEST_P(VideoDecoderTest, GetsFrameDisplayedAtTimestamp) {
 }
 
 TEST_P(VideoDecoderTest, SeeksToFrameWithSpecificPts) {
-  std::string path = getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4");
+  std::string path = getResourcePath("nasa_13013.mp4");
   std::unique_ptr<VideoDecoder> ourDecoder =
       createDecoderFromPath(path, GetParam());
   ourDecoder->addVideoStreamDecoder(-1);
@@ -311,8 +301,8 @@ TEST_P(VideoDecoderTest, SeeksToFrameWithSpecificPts) {
   auto output = ourDecoder->getNextDecodedOutput();
   torch::Tensor tensor6FromOurDecoder = output.frame;
   EXPECT_EQ(output.ptsSeconds, 180'180. / 30'000);
-  torch::Tensor tensor6FromFFMPEG = readTensorFromBMP(getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.time6.000000.bmp"));
+  torch::Tensor tensor6FromFFMPEG =
+      readTensorFromDisk("nasa_13013.mp4.time6.000000.pt");
   EXPECT_TRUE(torch::equal(tensor6FromOurDecoder, tensor6FromFFMPEG));
   EXPECT_EQ(ourDecoder->getDecodeStats().numSeeksAttempted, 1);
   // We skipped the seek since timestamp=6 and timestamp=0 share the same
@@ -327,8 +317,8 @@ TEST_P(VideoDecoderTest, SeeksToFrameWithSpecificPts) {
   output = ourDecoder->getNextDecodedOutput();
   torch::Tensor tensor61FromOurDecoder = output.frame;
   EXPECT_EQ(output.ptsSeconds, 183'183. / 30'000);
-  torch::Tensor tensor61FromFFMPEG = readTensorFromBMP(getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.time6.100000.bmp"));
+  torch::Tensor tensor61FromFFMPEG =
+      readTensorFromDisk("nasa_13013.mp4.time6.100000.pt");
   EXPECT_TRUE(torch::equal(tensor61FromOurDecoder, tensor61FromFFMPEG));
   EXPECT_EQ(ourDecoder->getDecodeStats().numSeeksAttempted, 1);
   // We skipped the seek since timestamp=6 and timestamp=6.1 share the same
@@ -347,8 +337,8 @@ TEST_P(VideoDecoderTest, SeeksToFrameWithSpecificPts) {
   output = ourDecoder->getNextDecodedOutput();
   torch::Tensor tensor10FromOurDecoder = output.frame;
   EXPECT_EQ(output.ptsSeconds, 300'300. / 30'000);
-  torch::Tensor tensor10FromFFMPEG = readTensorFromBMP(getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.time10.000000.bmp"));
+  torch::Tensor tensor10FromFFMPEG =
+      readTensorFromDisk("nasa_13013.mp4.time10.000000.pt");
   EXPECT_TRUE(torch::equal(tensor10FromOurDecoder, tensor10FromFFMPEG));
   EXPECT_EQ(ourDecoder->getDecodeStats().numSeeksAttempted, 1);
   // We cannot skip a seek here because timestamp=10 has a different keyframe
@@ -379,8 +369,8 @@ TEST_P(VideoDecoderTest, SeeksToFrameWithSpecificPts) {
   output = ourDecoder->getNextDecodedOutput();
   torch::Tensor tensor7FromOurDecoder = output.frame;
   EXPECT_EQ(output.ptsSeconds, 389'389. / 30'000);
-  torch::Tensor tensor7FromFFMPEG = readTensorFromBMP(getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.time12.979633.bmp"));
+  torch::Tensor tensor7FromFFMPEG =
+      readTensorFromDisk("nasa_13013.mp4.time12.979633.pt");
   EXPECT_TRUE(torch::equal(tensor7FromOurDecoder, tensor7FromFFMPEG));
   EXPECT_EQ(ourDecoder->getDecodeStats().numSeeksAttempted, 1);
   // We cannot skip a seek here because timestamp=6 has a different keyframe
@@ -392,18 +382,13 @@ TEST_P(VideoDecoderTest, SeeksToFrameWithSpecificPts) {
   EXPECT_GE(ourDecoder->getDecodeStats().numPacketsSentToDecoder, 150);
 
   if (FLAGS_dump_frames_for_debugging) {
-    dumpTensorToBMP(
-        tensor7FromFFMPEG,
-        "pytorch/torchcodec/test/decoders/tensor7FromFFMPEG.bmp");
-    dumpTensorToBMP(
-        tensor7FromOurDecoder,
-        "pytorch/torchcodec/test/decoders/tensor7FromOurDecoder.bmp");
+    dumpTensorToDisk(tensor7FromFFMPEG, "tensor7FromFFMPEG.pt");
+    dumpTensorToDisk(tensor7FromOurDecoder, "tensor7FromOurDecoder.pt");
   }
 }
 
 TEST_P(VideoDecoderTest, GetAudioMetadata) {
-  std::string path = getResourcePath(
-      "pytorch/torchcodec/test/decoders/resources/nasa_13013.mp4.audio.mp3");
+  std::string path = getResourcePath("nasa_13013.mp4.audio.mp3");
   std::unique_ptr<VideoDecoder> decoder =
       createDecoderFromPath(path, GetParam());
   VideoDecoder::ContainerMetadata metadata = decoder->getContainerMetadata();

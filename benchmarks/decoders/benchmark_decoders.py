@@ -1,4 +1,9 @@
-# (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import abc
 import argparse
 import importlib
@@ -11,7 +16,7 @@ import torch.utils.benchmark as benchmark
 import torchaudio
 import torchvision.io
 
-from torchcodec.decoders.core import (
+from torchcodec.decoders._core import (
     add_video_stream,
     create_from_file,
     get_next_frame,
@@ -28,7 +33,6 @@ class AbstractDecoder:
 
     @abc.abstractmethod
     def get_frames_from_video(self, video_file, pts_list):
-        # TODO(ahmads): add support for video from memory instead of a file.
         pass
 
 
@@ -251,7 +255,7 @@ def main() -> None:
     decoder_dict["TorchCodecDecoderNonCompiled"] = (
         TorchCodecDecoderNonCompiledWithOptions()
     )
-    decoder_dict["TMNonCompiled:ffmpeg_thread_count=1"] = (
+    decoder_dict["TCNonCompiled:ffmpeg_thread_count=1"] = (
         TorchCodecDecoderNonCompiledWithOptions(num_threads=1)
     )
     decoder_dict["TorchCodecDecoderCompiled"] = TorchCodecDecoderCompiled()
